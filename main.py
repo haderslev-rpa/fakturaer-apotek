@@ -1,13 +1,24 @@
 import asyncio
 import logging
-import sys
 import os
-from pprint import pprint  # helper (pæn print)
+import sys
+from pprint import pprint
+
+from konfiguration import (
+    AFDELING,
+    APOTEK_EAN,
+    LEVERANDOER_SOEGESTRENG,
+    PRISME_CREDENTIAL,
+    QUEUE_ID,
+    configure_logging,
+)
+
 
 # ------------------------------------------------------------
 # 🧠 PROCESS-KODE (ÉT ITEM)
 # ------------------------------------------------------------
-from behandel import behandel_page  # funktion (genbrugelig kodeblok)
+from behandel import behandel_page
+
 
 # ------------------------------------------------------------
 # 🧠 AUTOMATION SERVER
@@ -16,205 +27,452 @@ from automation_server_client import (
     AutomationServer,
     Workqueue,
     WorkItemError,
-    WorkItemStatus
+    WorkItemStatus,
 )
 
 from q_haderslev_vbo.automation_server.ats_update_item_data import (
-    update_item_data
+    update_item_data,
 )
-
 
 from q_haderslev_vbo.automation_server.ats_is_item_in_queue import (
     is_item_in_queue,
 )
 
 
-
 # ------------------------------------------------------------
-# 🌐 PLAYWRIGHT (KAN SLETTES I PROCESSER UDEN BROWSER)
+# 🧠 PRISME 365 API
 # ------------------------------------------------------------
-from q_haderslev_vbo.playwright.browser_session import BrowserSession
-
-def get_headless_flag():  #Skriv HEADLESS=false i .env for at se browseren under kørsel
-    return os.getenv("HEADLESS", "true").lower() == "true"
-
-
-# ------------------------------------------------------------
-# LOGGING (STANDARD)
-# ------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+from q_prisme365_api.api_client import (
+    initialiser_prisme,
 )
 
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("automation_server_client").setLevel(logging.WARNING)
-logging.getLogger("debugpy").setLevel(logging.WARNING)
+from q_prisme365_api.functionality.fakturaer import (
+    search_fakturaer,
+)
+
+# ------------------------------------------------------------
+# LOGGING
+# ------------------------------------------------------------
+configure_logging()
+
+# ------------------------------------------------------------
+# HJÆLPEFUNKTIONER
+# ------------------------------------------------------------
+def first_value(
+    data: dict,
+    *field_names: str,
+):
+    """
+    Returnerer første udfyldte feltværdi.
+
+    Prisme API kan bruge forskellige feltnavne,
+    afhængigt af hvilket endpoint der svarer.
+    """
+
+    for field_name in field_names:
+        value = data.get(
+            field_name
+        )
+
+        if value not in (
+            None,
+            "",
+        ):
+            return value
+
+    return None
+
+
+def first_text(
+    data: dict,
+    *field_names: str,
+) -> str:
+    """
+    Returnerer første udfyldte tekstværdi.
+    """
+
+    value = first_value(
+        data,
+        *field_names,
+    )
+
+    if value is None:
+        return ""
+
+    return str(
+        value
+    ).strip()
 
 
 # ------------------------------------------------------------
 # QUEUE-MODE (PRODUCER)
 # ------------------------------------------------------------
-async def populate_queue(workqueue: Workqueue, debug: bool):
+async def populate_queue(
+    workqueue: Workqueue,
+    debug: bool,
+):
+    """
+    Henter relevante apoteksfakturaer fra Prisme
+    og tilføjer dem til køen.
+
+    En faktura bliver kun tilføjet, når:
+
+    1. EAN er 5798005223924.
+    2. Leverandørnavnet indeholder "apotek".
+    3. Fakturaen ikke allerede findes i køen.
+
+    Fakturadetaljer hentes for at få EAN.
+
+    Dokumenter og OIOUBL hentes ikke her.
+    Dokumenterne hentes først i behandel.py.
+    """
+
     logger = logging.getLogger(__name__)
-    logger.info("Populate queue mode started")
 
-    # ❗ Ingen Playwright her (standard Automation Server, men kan tilføjes)
-    raw_items = [
-        {"cpr": "1234567891", "type": "adresseopslag"},
-        {"cpr": "1111111111", "type": "fødselsdato"},
-        {"cpr": "2222222222", "type": "myndighed"},
-    ]
+    logger.info(
+        f"Populate queue mode started "
+        f"(debug={debug})"
+    )
 
-    for raw_item in raw_items:
-        data_json = {}
+    # ==========================================================
+    # INITIALISÉR PRISME
+    # ==========================================================
+    initialiser_prisme(
+        PRISME_CREDENTIAL
+    )
 
-        update_item_data(
-            data_json,
-            box_updates=raw_item,
-            update=False
+
+
+    # --------------------------------------------------------
+    # HENT FAKTURAER FRA PRISME
+    #
+    # Detaljer skal hentes, fordi EAN først
+    # bliver udfyldt fra fakturadetaljerne.
+    #
+    # Dokumenter hentes ikke i queue-delen.
+    # --------------------------------------------------------
+    
+    fakturaer = search_fakturaer(
+        afdeling=AFDELING,
+        hent_detaljer=True,
+        hent_dokumenter=False,
+    )
+
+    if not isinstance(
+        fakturaer,
+        list,
+    ):
+        raise TypeError(
+            "search_fakturaer skal returnere "
+            "en liste."
         )
 
+    logger.info(
+        "Antal fakturaer fundet i Prisme: %s",
+        len(fakturaer),
+    )
 
-        item_reference = data_json["box"]["cpr"]
+    antal_tilfoejet = 0
+    antal_forkert_ean = 0
+    antal_ikke_apotek = 0
+    antal_findes_i_koe = 0
+    antal_ugyldige = 0
 
-        # Kontrollér om item allerede venter eller behandles.
+    # --------------------------------------------------------
+    # LOOP FAKTURAER
+    # --------------------------------------------------------
+    for faktura in fakturaer:
+
+        if not isinstance(
+            faktura,
+            dict,
+        ):
+            antal_ugyldige += 1
+
+            logger.warning(
+                "Springer faktura over, fordi "
+                "resultatet ikke er en dictionary."
+            )
+            continue
+
+        # ----------------------------------------------------
+        # HENT OPLYSNINGER FRA PRISME-RESULTATET
+        # ----------------------------------------------------
+        header_reference = str(
+            faktura.get(
+                "HeaderReference",
+                "",
+            )
+            or ""
+        ).strip()
+
+        fakturanr = str(
+            faktura.get(
+                "Fakturanr",
+                "",
+            )
+            or ""
+        ).strip()
+
+        leverandoernavn = str(
+            faktura.get(
+                "Leverandørnavn",
+                "",
+            )
+            or ""
+        ).strip()
+
+        ean = str(
+            faktura.get(
+                "EAN",
+                "",
+            )
+            or ""
+        ).strip()
+
+        # ----------------------------------------------------
+        # KONTROLLÉR OBLIGATORISKE FELTER
+        # ----------------------------------------------------
+        if not header_reference:
+            antal_ugyldige += 1
+
+            logger.warning(
+                "Springer faktura over, fordi "
+                "HeaderReference mangler."
+            )
+            continue
+
+        if not fakturanr:
+            antal_ugyldige += 1
+
+            logger.warning(
+                "Springer faktura over, fordi "
+                "Fakturanr mangler. "
+                "HeaderReference: %s.",
+                header_reference,
+            )
+            continue
+
+        if not leverandoernavn:
+            antal_ugyldige += 1
+
+            logger.warning(
+                "Springer faktura over, fordi "
+                "Leverandørnavn mangler. "
+                "HeaderReference: %s. "
+                "Fakturanr: %s.",
+                header_reference,
+                fakturanr,
+            )
+            continue
+
+        # ----------------------------------------------------
+        # KONTROLLÉR EAN
+        # ----------------------------------------------------
+        if ean != APOTEK_EAN:
+            antal_forkert_ean += 1
+            continue
+
+        # ----------------------------------------------------
+        # KONTROLLÉR LEVERANDØRNAVN
+        # ----------------------------------------------------
+        if (
+            LEVERANDOER_SOEGESTRENG.casefold()
+            not in leverandoernavn.casefold()
+        ):
+            antal_ikke_apotek += 1
+            continue
+
+        # ----------------------------------------------------
+        # BYG ITEM-REFERENCE
+        # ----------------------------------------------------
+        item_reference = (
+            f"{header_reference} | "
+            f"{fakturanr} | "
+            f"{leverandoernavn}"
+        )
+
+        # ----------------------------------------------------
+        # KONTROLLÉR OM ITEM ALLEREDE FINDES
+        # ----------------------------------------------------
         if is_item_in_queue(
-            queue_id= #INDSÆT ID på QUEUE - men skal gerne laves fra .env eller automation server ved ved ikke hvordan endnu.
+            queue_id=QUEUE_ID,
             item_reference=item_reference,
             new=True,
             in_progress=True,
             completed=True,
-            new=True,
-            pending_user_action=True
-            start_datetime="2025-07-01T00:00:00Z",
-            end_datetime="2026-07-31T23:59:59.999999Z",
+            failed=True,
+            pending_user_action=True,
             updated_at=False,
         ):
-            print(
-                f"Springer over: Item med reference "
-                f"'{item_reference}' findes allerede i køen."
+            antal_findes_i_koe += 1
+
+            logger.info(
+                "Springer over: Item med reference "
+                "'%s' findes allerede i køen.",
+                item_reference,
             )
             continue
 
+        # ----------------------------------------------------
+        # OPBYG ITEM.DATA
+        # ----------------------------------------------------
+        data_json = {}
+
+        update_item_data(
+            data_json,
+            box_updates={
+                "header_reference": (
+                    header_reference
+                ),
+                "fakturanr": (
+                    fakturanr
+                ),
+                "leverandoernavn": (
+                    leverandoernavn
+                ),
+                "ean": ean,
+                "afdeling": (
+                    AFDELING
+                ),
+            },
+            update=False,
+        )
+
+        # ----------------------------------------------------
+        # TILFØJ ITEM TIL KØEN
+        # ----------------------------------------------------
         workqueue.add_item(
             data=data_json,
             reference=item_reference,
         )
 
-        print(
-            f"Item med reference '{item_reference}' "
-            "er tilføjet til køen."
+        antal_tilfoejet += 1
+
+        logger.info(
+            "Item med reference '%s' "
+            "er tilføjet til køen.",
+            item_reference,
         )
 
-
-
-
-    
-
+    # --------------------------------------------------------
+    # OPSUMMERING
+    # --------------------------------------------------------
+    logger.info(
+        "Populate queue mode completed. "
+        "Fundet i Prisme: %s. "
+        "Tilføjet: %s. "
+        "Forkert EAN: %s. "
+        "Leverandør uden 'apotek': %s. "
+        "Findes allerede i køen: %s. "
+        "Ugyldige fakturaer: %s.",
+        len(fakturaer),
+        antal_tilfoejet,
+        antal_forkert_ean,
+        antal_ikke_apotek,
+        antal_findes_i_koe,
+        antal_ugyldige,
+    )
 
 # ------------------------------------------------------------
 # PROCESS-MODE (WORKER)
 # ------------------------------------------------------------
-async def process_workqueue(workqueue: Workqueue, debug: bool):
+async def process_workqueue(
+    workqueue: Workqueue,
+    debug: bool,
+):
     logger = logging.getLogger(__name__)
-    logger.info(f"Process workqueue mode started (debug={debug})")
 
-    # =========================================================
-    # 🌐 PLAYWRIGHT – ÉN BROWSERSESSION FOR HELE PROCESSEN
-    #
-    # ✅ KAN SLETTES i processer uden browser
-    # =========================================================
-    headless = get_headless_flag()
-    session = BrowserSession(headless=headless,debug=debug)
-    await session.start()
-    page = await session.new_page()  # Page (browser-fane)
+    logger.info(
+        f"Process workqueue mode started "
+        f"(debug={debug})"
+    )
 
-    try: # denne try bruges kun til PLAYWRIGHT processer
-        # Workqueue er iterable → hvert item behandles ét ad gangen
-        for item in workqueue:
+    for item in workqueue:
 
-            with item:
+        with item:
+            data = item.data
+
+            try:
+                print(
+                    "==================================== "
+                    "NEXT ITEM "
+                    "===================================="
+                )
+
+                pprint(data)
+
+                # --------------------------------------------------
+                # PROCESS-KODE
+                # --------------------------------------------------
+                resultat = await behandel_page(
+                    item=item
+                )
+
+                # Genindlæs itemdata efter behandlingen.
                 data = item.data
 
-                try:
-                    print("==================================== NEXT ITEM ====================================")
-                    pprint(data)
-
-                    # --------------------------------------------------
-                    # ▶ PROCESS-KODE
-                    # (behandel_page bruger Playwright internt)
-                    # --------------------------------------------------
-                    await behandel_page(item=item, session=session, page=page) #Fjern session og page hvis du ikke bruger Playwright i din process
-
-                    update_item_data(
-                        data,
-                        item=item,
-                        status="Completed",
-                        status_code="Færdig",
-                        state="Completed",
-
+                # --------------------------------------------------
+                # STATUS SÆTTES KUN HER TIL SIDST
+                # --------------------------------------------------
+                if resultat:
+                    status = resultat.get(
+                        "status",
+                        "Completed",
                     )
 
-                    item.update(data)
-                    item.complete("Completed")
+                    status_code = resultat.get(
+                        "status_code",
+                        "Færdig",
+                    )
 
-                except WorkItemError as e:
-                    # =================================================
-                    # ✅ SOFT ERROR
-                    # - Item fejler
-                    # =================================================
-                    logger.error(f"WorkItemError for item {item.reference}: {e}")
-                    item.fail(str(e))
-                    
-                    # Playwright:
-                    # Luk browser for sikkerhed (ny session på næste item)
-                    headless = get_headless_flag()
-                    session = BrowserSession(headless=headless,debug=debug)
-                    await session.start()
+                else:
+                    status = "Completed"
+                    status_code = "Færdig"
 
-                except Exception as e:
-                    # =================================================
-                    # ❌ HARD ERROR
-                    # - Screenshot tages
-                    # - Browser lukkes
-                    # - Processen STOPPER
-                    # =================================================
-                    logger.exception("Uventet fejl")
+                update_item_data(
+                    data,
+                    item=item,
+                    status=status,
+                    status_code=status_code,
+                    state="Completed",
+                )
 
-                    try: #Playwright:
-                        if session.context and session.context.pages:
-                            page = session.context.pages[-1]
-                            await session.screenshot(
-                                page,
-                                f"hard_exception_{type(e).__name__}",
-                                always=True
-                            )
-                    except Exception:
-                        logger.warning("Kunne ikke tage screenshot ved hard error")
+                item.update(data)
 
-                    # Luk ALT (Playwright)
-                    await session.close()
+                item.complete(status)
 
-                    # Stop hele processen (Automation Server genstarter)
-                    raise
+                logger.info(
+                    "Item %s afsluttet med "
+                    "status '%s' og statuskode '%s'.",
+                    item.reference,
+                    status,
+                    status_code,
+                )
 
-    finally: # PLAYWRIGHT:
-        # =====================================================
-        # 🧹 SIKKER OPRYDNING
-        #
-        # ✅ Lukker browser hvis processen afsluttes normalt
-        # =====================================================
-        await session.close() # denne try bruges kun til PLAYWRIGHT processer og kan slettes
+            except WorkItemError as error:
+                # =================================================
+                # SOFT ERROR
+                # =================================================
+                logger.error(
+                    "WorkItemError for item %s: %s",
+                    item.reference,
+                    error,
+                )
 
+                item.fail(
+                    str(error)
+                )
+
+                raise
 
 # ------------------------------------------------------------
 # MAIN ENTRY POINT
 # ------------------------------------------------------------
 if __name__ == "__main__":
 
-    # ✅ CLI flags (runtime-parametre)
-    DEBUG = "--debug" in sys.argv   # bool (sand/falsk)
+    # CLI flags (runtime-parametre)
+    DEBUG = "--debug" in sys.argv
     QUEUE_MODE = "--queue" in sys.argv
 
     ats = AutomationServer.from_environment()
@@ -224,20 +482,33 @@ if __name__ == "__main__":
     # QUEUE-MODE
     # --------------------------------------------------------
     if QUEUE_MODE:
-        # ---------------------------------------------------------------
+        # ----------------------------------------------------
         # VIGTIGT:
         # Denne linje CLEARSER alle NEW items i køen.
         #
-        # ❗ Hvis du ALDRIG vil slette eksisterende NEW items:
-        #     → så SKAL denne linje fjernes eller kommenteres ud.
-        #
-        # workqueue.clear_workqueue(WorkItemStatus.NEW)
-        
-        workqueue.clear_workqueue(WorkItemStatus.NEW)
-        asyncio.run(populate_queue(workqueue, debug=DEBUG))
+        # Hvis du ALDRIG vil slette eksisterende NEW items:
+        # Fjern eller kommentér linjen ud.
+        # ----------------------------------------------------
+
+        #workqueue.clear_workqueue(
+        #    WorkItemStatus.NEW
+        #)
+
+        asyncio.run(
+            populate_queue(
+                workqueue,
+                debug=DEBUG,
+            )
+        )
+
         sys.exit(0)
 
     # --------------------------------------------------------
     # PROCESS-MODE
     # --------------------------------------------------------
-    asyncio.run(process_workqueue(workqueue, debug=DEBUG))
+    asyncio.run(
+        process_workqueue(
+            workqueue,
+            debug=DEBUG,
+        )
+    )

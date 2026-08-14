@@ -1,5 +1,5 @@
 [project]
-name = "process-template"
+name = "fakturaer-apotek"
 version = "0.2.0"
 description = "Add your description here"
 readme = "README.md"
@@ -7,8 +7,14 @@ requires-python = ">=3.13"
 dependencies = [
     "automation-server-client",
     "q-haderslev-vbo",
+    "q-prisme365-api",
+    "q-oioubl-faktura-parser",
+    "q-datafordeleren-api"
 ]
 
 [tool.uv.sources]
 automation-server-client = { git = "https://github.com/odense-rpa/automation-server-client.git", tag = "v0.3.0" }
 q-haderslev-vbo = { git = "https://github.com/haderslev-rpa/q-haderslev-vbo.git", branch = "main" }
+q-prisme365-api = { git = "https://github.com/haderslev-rpa/q-prisme365-api.git", branch = "main" }
+q-oioubl-faktura-parser = { git = "https://github.com/haderslev-rpa/q-oioubl-faktura-parser.git", branch = "main" }
+q-datafordeleren-api = { git = "https://github.com/haderslev-rpa/q-datafordeleren-api.git", branch = "main" }
