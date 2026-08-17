@@ -45,6 +45,7 @@ from q_prisme365_api.api_client import (
 )
 
 from q_prisme365_api.functionality.fakturaer import (
+    approve_faktura,
     search_fakturaer,
     update_faktura_beskrivelse,
 )
@@ -80,14 +81,8 @@ from konfiguration import (
     STATUS_CODE_MANUEL_UGYLDIGT_CPR,
     STATUS_MANUEL,
     UDFOER_KONTERING,
+    ENABLE_GODKENDELSE,
 )
-
-
-# Godkendelse er klargjort, men ikke aktiveret.
-#
-# from q_prisme365_api.functionality.fakturaer import (
-#     approve_faktura,
-# )
 
 
 logger = logging.getLogger(__name__)
@@ -1095,80 +1090,115 @@ async def behandel_page(
         )
 
     # ==========================================================
-    # GODKENDELSE ER IKKE AKTIVERET
+    # GODKEND FAKTURA
     # ==========================================================
-    #
-    # step = "GODKEND_FAKTURA"
-    #
-    # state = getattr(
-    #     States,
-    #     step,
-    # )
-    #
+
+    step = "GODKEND_FAKTURA"
+
+    state = getattr(
+        States,
+        step,
+    )
+
     # STATE-KONTROL ER DEAKTIVERET.
+    #
+    # Aktivér senere ved at erstatte:
+    #
+    #     if True:
+    #
+    # med:
+    #
+    #     if mangler_state(
+    #         state,
+    #         step,
+    #     ):
     #
     # if mangler_state(
     #     state,
     #     step,
     # ):
-    # if True:
-    #
-    #     if faktura is None:
-    #         faktura = hent_faktura()
-    #
-    #     if not fakturalinjer:
-    #         (
-    #             parsed_invoice,
-    #             fakturalinjer,
-    #         ) = hent_parserdata()
-    #
-    #     if not konteringslinjer:
-    #         konteringslinjer = (
-    #             _byg_konteringslinjer(
-    #                 faktura=faktura,
-    #                 fakturalinjer=fakturalinjer,
-    #                 leverandoernavn=str(
-    #                     box.get(
-    #                         "leverandoernavn",
-    #                         "",
-    #                     )
-    #                     or ""
-    #                 ).strip(),
-    #             )
-    #         )
-    #
-    #     fakturabeloeb = _to_decimal(
-    #         faktura[
-    #             "Importeret fakturabeløb"
-    #         ]
-    #     )
-    #
-    #     samlet_konteringsbeloeb = sum(
-    #         (
-    #             linje["Bruttobeløb"]
-    #             for linje in konteringslinjer
-    #         ),
-    #         start=Decimal("0.00"),
-    #     )
-    #
-    #     approve_faktura(
-    #         rec_id_loc=int(
-    #             box["rec_id_loc"]
-    #         ),
-    #         fakturabeloeb=fakturabeloeb,
-    #         konteringslinjer_totalbeloeb=(
-    #             samlet_konteringsbeloeb
-    #         ),
-    #         godkender_1="DIRXFB",
-    #         afdeling=AFDELING,
-    #     )
-    #
-    #     set_state(
-    #         state
-    #     )
+    if ENABLE_GODKENDELSE:
 
+        log_step(
+            step,
+            "Start",
+        )
+
+        if faktura is None:
+            faktura = hent_faktura()
+
+        if not fakturalinjer:
+            (
+                parsed_invoice,
+                fakturalinjer,
+            ) = hent_parserdata()
+
+        if not konteringslinjer:
+            konteringslinjer = (
+                _byg_konteringslinjer(
+                    faktura=faktura,
+                    fakturalinjer=fakturalinjer,
+                    leverandoernavn=str(
+                        box.get(
+                            "leverandoernavn",
+                            "",
+                        )
+                        or ""
+                    ).strip(),
+                )
+            )
+
+        fakturabeloeb = _to_decimal(
+            faktura.get(
+                "Importeret fakturabeløb"
+            )
+        )
+
+        samlet_konteringsbeloeb = sum(
+            (
+                linje["Bruttobeløb"]
+                for linje in konteringslinjer
+            ),
+            start=Decimal("0.00"),
+        )
+
+        approve_faktura(
+            rec_id_loc=int(
+                box["rec_id_loc"]
+            ),
+            fakturabeloeb=fakturabeloeb,
+            konteringslinjer_totalbeloeb=(
+                samlet_konteringsbeloeb
+            ),
+            godkender_1="DIRXFB",
+            afdeling=AFDELING,
+        )
+
+        box["godkendelse_udfoert"] = True
+
+        update_item_data(
+            data,
+            item=item,
+        )
+
+        set_state(
+            state
+        )
+
+        log_step(
+            step,
+            "Faktura godkendt",
+        )
+
+    else:
+        log_step(
+            step,
+            "Godkendelse er slået fra i konfiguration.py",
+        )
+
+    # Ingen særlig slutstatus.
+    # main.py markerer itemet som færdigt.
     return None
-
 
 # ==========================================================
 # HENT FAKTURA
