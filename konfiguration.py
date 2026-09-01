@@ -18,7 +18,7 @@ import logging
 # GODKENDELSE
 # ==========================================================
 
-ENABLE_GODKENDELSE = False
+ENABLE_GODKENDELSE = True
 
 # ==========================================================
 # PRISME
