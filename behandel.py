@@ -1478,7 +1478,7 @@ def _byg_konteringslinjer(
         fakturamaaned_og_aar
         + POSTERINGSTEKST_SEPARATOR
         + leverandoernavn
-    )
+    )[:60]
 
     konteringslinjer = []
 
